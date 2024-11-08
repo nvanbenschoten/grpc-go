@@ -39,53 +39,176 @@ var updateHeaderTblSize = func(e *hpack.Encoder, v uint32) {
 	e.SetMaxDynamicTableSizeLimit(v)
 }
 
-type itemNode struct {
-	it   interface{}
-	next *itemNode
-}
-
 type itemList struct {
-	head *itemNode
-	tail *itemNode
+	head, tail *itemListChunk
 }
 
-func (il *itemList) enqueue(i interface{}) {
-	n := &itemNode{it: i}
-	if il.tail == nil {
-		il.head, il.tail = n, n
+func (l *itemList) enqueue(i interface{}) {
+	if l.tail == nil {
+		chunk := newBufferEntryChunk()
+		l.head, l.tail = chunk, chunk
+		l.head.push(i) // guaranteed to insert into new chunk
 		return
 	}
-	il.tail.next = n
-	il.tail = n
+
+	if !l.tail.push(i) {
+		chunk := newBufferEntryChunk()
+		l.tail.next = chunk
+		l.tail = chunk
+		l.tail.push(i) // guaranteed to insert into new chunk
+	}
 }
 
 // peek returns the first item in the list without removing it from the
 // list.
-func (il *itemList) peek() interface{} {
-	return il.head.it
-}
-
-func (il *itemList) dequeue() interface{} {
-	if il.head == nil {
+func (l *itemList) peek() interface{} {
+	if l.head == nil {
 		return nil
 	}
-	i := il.head.it
-	il.head = il.head.next
-	if il.head == nil {
-		il.tail = nil
+	return l.head.peek()
+}
+
+func (l *itemList) isEmpty() bool {
+	return l.head == nil || l.head.isEmpty()
+}
+
+func (l *itemList) dequeue() interface{} {
+	if l.head == nil {
+		return nil
 	}
+
+	i, ok, consumedAllFromChunk := l.head.pop()
+
+	if consumedAllFromChunk {
+		toFree := l.head
+		if l.tail == l.head {
+			l.tail = l.head.next
+		}
+		l.head = l.head.next
+		freeBufferEventChunk(toFree)
+		if !ok {
+			return l.dequeue()
+		}
+	}
+
+	if !ok {
+		return nil
+	}
+
 	return i
 }
 
-func (il *itemList) dequeueAll() *itemNode {
-	h := il.head
-	il.head, il.tail = nil, nil
-	return h
+const itemListChunkSize = 32
+
+type itemListChunk struct {
+	items      [itemListChunkSize]interface{}
+	head, tail int32
+	next       *itemListChunk // linked-list element
 }
 
-func (il *itemList) isEmpty() bool {
-	return il.head == nil
+var bufferEntryChunkPool = sync.Pool{
+	New: func() interface{} {
+		return new(itemListChunk)
+	},
 }
+
+func newBufferEntryChunk() *itemListChunk {
+	return bufferEntryChunkPool.Get().(*itemListChunk)
+}
+
+func freeBufferEventChunk(c *itemListChunk) {
+	*c = itemListChunk{}
+	bufferEntryChunkPool.Put(c)
+}
+
+func (bec *itemListChunk) push(i interface{}) (inserted bool) {
+	if bec.tail == itemListChunkSize {
+		return false
+	}
+
+	bec.items[bec.tail] = i
+	bec.tail++
+	return true
+}
+
+func (bec *itemListChunk) peek() interface{} {
+	if bec.head == itemListChunkSize {
+		return nil
+	}
+
+	if bec.head == bec.tail {
+		return nil
+	}
+
+	return bec.items[bec.head]
+}
+
+func (bec *itemListChunk) pop() (i interface{}, ok bool, consumedAll bool) {
+	if bec.head == itemListChunkSize {
+		return nil, false, true
+	}
+
+	if bec.head == bec.tail {
+		return nil, false, false
+	}
+
+	i = bec.items[bec.head]
+	bec.items[bec.head] = nil
+	bec.head++
+	return i, true, bec.head == itemListChunkSize
+}
+
+func (bec *itemListChunk) isEmpty() bool {
+	return bec.tail == bec.head
+}
+
+//type itemNode struct {
+//	it   interface{}
+//	next *itemNode
+//}
+//
+//type itemList struct {
+//	head *itemNode
+//	tail *itemNode
+//}
+//
+//func (il *itemList) enqueue(i interface{}) {
+//	n := &itemNode{it: i}
+//	if il.tail == nil {
+//		il.head, il.tail = n, n
+//		return
+//	}
+//	il.tail.next = n
+//	il.tail = n
+//}
+//
+//// peek returns the first item in the list without removing it from the
+//// list.
+//func (il *itemList) peek() interface{} {
+//	return il.head.it
+//}
+//
+//func (il *itemList) dequeue() interface{} {
+//	if il.head == nil {
+//		return nil
+//	}
+//	i := il.head.it
+//	il.head = il.head.next
+//	if il.head == nil {
+//		il.tail = nil
+//	}
+//	return i
+//}
+//
+//func (il *itemList) dequeueAll() *itemNode {
+//	h := il.head
+//	il.head, il.tail = nil, nil
+//	return h
+//}
+//
+//func (il *itemList) isEmpty() bool {
+//	return il.head == nil
+//}
 
 // The following defines various control items which could flow through
 // the control buffer of transport. They represent different aspects of
@@ -433,13 +556,12 @@ func (c *controlBuffer) finish() {
 	// There may be headers for streams in the control buffer.
 	// These streams need to be cleaned out since the transport
 	// is still not aware of these yet.
-	for head := c.list.dequeueAll(); head != nil; head = head.next {
-		hdr, ok := head.it.(*headerFrame)
-		if !ok {
-			continue
-		}
-		if hdr.onOrphaned != nil { // It will be nil on the server-side.
-			hdr.onOrphaned(ErrConnClosing)
+	for !c.list.isEmpty() {
+		it := c.list.dequeue()
+		if hdr, ok := it.(*headerFrame); ok {
+			if hdr.onOrphaned != nil {
+				hdr.onOrphaned(ErrConnClosing)
+			}
 		}
 	}
 	// In case throttle() is currently in flight, it needs to be unblocked.
